@@ -1,0 +1,259 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install llama_index
+!pip install transformers faiss-cpu torch
+!pip install sentence-transformers
+!pip install llama_index.embeddings.huggingface
+
+import re
+from llama_index.core.schema import TextNode
+import uuid
+import faiss
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import json
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+import os
+
+basepath='/content/drive/MyDrive/Colab Notebooks/resume-dataset'
+file_paths=[os.path.join(basepath,f"resume{i}.txt") for i in range(1,61)]
+
+def read_text_file(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        text = file.read()
+    return text
+
+patterns = {
+    'name': r'^(.*)',
+    'email': r'Email\s*:\s*(\S+)',
+    'skill': r'Skills\s*[:\n•]+\s*([^\n]*)',
+    'project_content': r'Projects\s*[:\n•]+\s*(.*)'
+}
+
+def extract_matches(text, patterns):
+    name_match = re.search(patterns['name'], text, re.MULTILINE)
+    email_match = re.search(patterns['email'], text, re.MULTILINE)
+    skill_matches = re.findall(patterns['skill'], text, re.DOTALL)
+    project_matches = re.findall(patterns['project_content'], text, re.DOTALL)
+    return name_match,email_match,skill_matches, project_matches
+
+data = []
+
+for file_path in file_paths:
+    text_content = read_text_file(file_path)
+    name_match,email_match,skill_matches, project_matches = extract_matches(text_content, patterns)
+    data.append({
+        "name": name_match.group(1),
+        "email": email_match.group(1),
+        "skills": "\n".join(skill_matches),
+        "projects":"\n".join(project_matches)
+    })
+
+print(data[4])
+
+nodes = []
+skill= [student['skills'] for student in data]
+print(skill[1])
+project= [student['projects'] for student in data]
+Name= [student['name'] for student in data]
+Email= [student['email'] for student in data]
+
+for i in range(len(skill)):
+    skill_node = TextNode(text=skill[i], id_=str(uuid.uuid4()))
+    skill_node.metadata = {'name': Name[i], 'email': Email[i], 'category': 'skill'}
+    nodes.append(skill_node)
+
+    project_node = TextNode(text=project[i], id_=str (uuid.uuid4()))
+    project_node.metadata = {'name': Name[i], 'email': Email[i], 'category': 'project'}
+    nodes.append(project_node)
+
+print(nodes)
+
+embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
+
+for i in range(len(nodes)):
+    nodes[i].embedding = embed_model.get_text_embedding(nodes[i].text)
+
+nodes_embedding=[]
+for i in range(len(nodes)):
+    nodes_embedding.append(nodes[i].embedding)
+
+nodes_embedding = np.array(nodes_embedding)
+
+def normalize_vectors(vectors):
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / norms
+
+embeddings_array = np.array([node.embedding for node in nodes], dtype=np.float32)
+normalized_embeddings = normalize_vectors(embeddings_array)
+
+dimension = normalized_embeddings.shape[1]
+index = faiss.IndexFlatIP(dimension)
+index.add(normalized_embeddings)
+
+def search_similar_nodes(query_content, k):
+    query_embedding = embed_model.get_text_embedding(query_content)
+    query_embedding = normalize_vectors(np.array([query_embedding], dtype=np.float32))
+
+    distances, indices = index.search(query_embedding, k)
+
+    results = []
+    for i, idx in enumerate(indices[0]):
+        result = {
+            "text": nodes[idx].text,
+            "metadata": nodes[idx].metadata,
+            "embedding": nodes[idx].embedding,
+            "distance": distances[0][i]
+        }
+        results.append(result)
+    return results
+
+import json
+
+def extract_skills(skills_str):
+    return [skill.strip() for skill in skills_str.replace('Skills:', '').split(',')]
+
+def generate_qa_dataset(data):
+    queries = []
+    corpus = []
+    relevant_docs = []
+    skill_to_docs = {}
+
+    for i, person in enumerate(data):
+        doc_id = f"doc{i+1}"
+        skills = extract_skills(person['skills'])
+        text = f"{person['name']} has skills in {', '.join(skills)}."
+        corpus.append({"doc_id": doc_id, "text": text})
+
+        for skill in skills:
+            if skill not in skill_to_docs:
+                skill_to_docs[skill] = []
+            skill_to_docs[skill].append(doc_id)
+
+
+    query_id = 1
+    for skill, doc_ids in skill_to_docs.items():
+        question = f"Who has the skill {skill}?"
+        queries.append({"query_id": str(query_id), "question": question})
+        relevant_docs.append({"query_id": str(query_id), "relevant_doc_ids": doc_ids})
+        query_id += 1
+
+    dataset = {
+        "queries": queries,
+        "corpus": corpus,
+        "relevant_docs": relevant_docs
+    }
+
+    return dataset
+
+
+qa_dataset = generate_qa_dataset(data)
+
+print(json.dumps(qa_dataset, indent=2))
+
+def corpus_embedding(corpus):
+    doc_id=[]
+    embeddings1=[]
+    for doc in corpus:
+        doc_id.append(doc['doc_id'])
+        embeddings1.append(embed_model.get_text_embedding(doc['text']))
+    embeddings1= np.array(embeddings1, dtype=np.float32)
+    normalized_embeddings1= normalize_vectors(embeddings1)
+    return doc_id,normalized_embeddings1
+
+def search_similar_docs1(query_embedding, index, k):
+    query_embedding = normalize_vectors(np.array([query_embedding], dtype=np.float32))
+    distances, indices = index.search(query_embedding, k)
+    return indices[0], distances[0]
+
+def evaluate_retriever(qa_dataset, k):
+    hit_rate = 0
+    reciprocal_ranks = []
+
+    corpus = qa_dataset["corpus"]
+    doc_ids, normalized_corpus_embeddings = corpus_embedding(corpus)
+
+    dimension = normalized_corpus_embeddings.shape[1]
+    index1= faiss.IndexFlatIP(dimension)
+    index1.add(normalized_corpus_embeddings)
+
+    for query in qa_dataset["queries"]:
+        query_id = query["query_id"]
+        query_text = query["question"]
+
+        relevant_docs_entry = next((item for item in qa_dataset["relevant_docs"] if item["query_id"] == query_id), None)
+        if relevant_docs_entry:
+            relevant_docs = relevant_docs_entry["relevant_doc_ids"]
+        else:
+            relevant_docs = []
+
+        query_embedding = embed_model.get_text_embedding(query_text)
+
+        indices, distances = search_similar_docs1(query_embedding, index1, k)
+
+        relevant_set = set(relevant_docs)
+        found = False
+
+        for rank, idx in enumerate(indices):
+            doc_id = doc_ids[idx]
+            if doc_id in relevant_set:
+                hit_rate += 1
+                reciprocal_ranks.append(1 / (rank + 1))
+                found = True
+                break
+
+        if not found:
+            reciprocal_ranks.append(0)
+
+    hit_rate /= len(qa_dataset["queries"])
+    mrr = np.mean(reciprocal_ranks)
+
+    return hit_rate, mrr
+
+k = 4
+hit_rate, mrr = evaluate_retriever(qa_dataset, k)
+
+print(f"Hit Rate @ {k}: {hit_rate}")
+print(f"MRR @ {k}: {mrr}")
+
+print(json.dumps(qa_dataset,indent=2))
+
+def create_session():
+    return str(uuid.uuid4())
+
+session_data={}
+
+def add_to_session(session_id,query_content,result1,result2):
+    if session_id not in session_data:
+        session_data[session_id] ={'history':[]}
+    session_data[session_id]['history'].append({"question":query_content,"results":[result1],"Metadata":[result2]})
+
+
+session=create_session()
+
+while True:
+    query_content = input("Enter your query: ")
+    if query_content.lower() in ["exit", "quit"]:
+        break
+    try:
+        k = int(input("Enter the number of results you want to see: "))
+        if k <= 0:
+            print("Please enter a positive number.")
+            continue
+    except ValueError:
+        print("Please enter a valid number.")
+        continue
+    results = search_similar_nodes(query_content, k)
+    if results:
+        for result in results:
+            print("--")
+            print("Text:", result['text'])
+
+            print("Metadata:", result['metadata'])
+            print("--")
+            print()
+    else:
+        print("No results found.")
+
+    add_to_session(session,query_content,result['text'],result['metadata'])
